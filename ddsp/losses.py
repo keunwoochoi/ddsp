@@ -16,6 +16,7 @@
 """Library of loss functions."""
 
 import functools
+from absl import logging
 
 import crepe
 from ddsp import spectral_ops
@@ -61,10 +62,63 @@ class PitchLoss(tfkl.Layer):
   def __init__(self, name='pitch_loss'):
     super().__init__(name=name)
 
-  def call(self, pitch_shift_steps, f0_hz_shift, f0_hz):
+  def call(self, pitch_shift_steps, f0_hz_shift, f0_hz, coeff=20.):
     pitch_shift_steps = tf.reshape(pitch_shift_steps, (-1, 1, 1))  # (16, 1, 1)
     pitch_shift_steps = pitch_shift_steps * tf.ones_like(f0_hz_shift - f0_hz)  # (16, 1000, 1)
-    return tf1.losses.huber_loss(pitch_shift_steps, f0_hz_shift - f0_hz)
+    return coeff * tf1.losses.huber_loss(pitch_shift_steps, f0_hz_shift - f0_hz,
+                                         reduction=tf1.losses.Reduction.MEAN)
+
+
+@gin.register
+class PitchLossCho(tfkl.Layer):
+  def __init__(self, name='pitch_loss_cho'):
+    super().__init__(name=name)
+
+  def call(self, pitch_shift_steps, f0_hz_shift, f0_hz, coeff=20., reg_coeff=0.001):
+    pitch_shift_steps = tf.reshape(pitch_shift_steps, (-1, 1, 1))  # (16, 1, 1)
+    pitch_shift_steps = pitch_shift_steps * tf.ones_like(f0_hz_shift - f0_hz)  # (16, 1000, 1)
+    return coeff * (tf1.losses.huber_loss(pitch_shift_steps, f0_hz_shift - f0_hz,
+                                         reduction=tf1.losses.Reduction.MEAN)
+                    + reg_coeff * tf.reduce_mean(tf.math.pow(f0_hz, 2)))
+
+
+@gin.register
+class SalienceLoss(tfkl.Layer):
+  def __init__(self, name='salience_loss'):
+    super().__init__(name=name)
+
+  def call(self, pitch_shift_step, salience_shift, salience, coeff=100000000):
+    """
+    pitch_shift_step: (batch, 1) [20 cent]
+    salience_shift: (batch, 1000, 360)
+    salience: (batch, 1000, 360), where 1 pitch-index diff means 20 cent
+    """
+    # pitch_shift_20cents = tf.cast(pitch_shift_20cents, tf.int32)
+
+    batch_size = pitch_shift_step.shape[0]
+    losses = 0.0
+    # normalize salience
+    salience = tf.nn.softmax(salience, axis=-1)
+    salience_shift = tf.nn.softmax(salience_shift, axis=-1)
+
+    for idx in range(batch_size):
+      if tf.greater(pitch_shift_step[idx], tf.constant(0)):  # salience_shift is higher in pitch
+        huber_loss = tf1.losses.huber_loss(salience_shift[idx, :, pitch_shift_step[idx]:],
+                                         salience[idx, :, :-pitch_shift_step[idx]],
+                                         reduction=tf1.losses.Reduction.MEAN)
+        # logging.error('shift----positive')
+      elif tf.less(pitch_shift_step[idx], tf.constant(0)):  # salience_shift is lower in pitch
+        huber_loss = tf1.losses.huber_loss(salience_shift[idx, :, :pitch_shift_step[idx]],
+                                           salience[idx, :, -pitch_shift_step[idx]:],
+                                           reduction=tf1.losses.Reduction.MEAN)
+        # logging.error('shift--------------negative')
+      else:
+        # logging.error('Hey zero shift step really? no way')
+        huber_loss = 0.0
+
+      losses += coeff * huber_loss
+
+    return tf1.reduce_mean(losses)
 
 
 @gin.register
