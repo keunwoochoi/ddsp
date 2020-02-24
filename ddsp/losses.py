@@ -52,9 +52,22 @@ def mean_difference(target, value, loss_type='L1'):
     return tf.reduce_mean(difference**2)
   elif loss_type == 'COSINE':
     return tf.losses.cosine_distance(target, value, axis=-1)
+  elif loss_type == 'huber':
+    return tf1.losses.huber_loss(target, value,
+                                 reduction=tf1.losses.Reduction.MEAN)
   else:
     raise ValueError('Loss type ({}), must be '
                      '"L1", "L2", or "COSINE"'.format(loss_type))
+
+
+@gin.register
+class DisentangleLossSimple(tfkl.Layer):
+  def __init__(self, name='disentangle_loss_simple'):
+    super().__init__(name=name)
+
+  def call(self, z_original, z_shift, loss_type='huber', coeff=1e1):
+    loss = coeff * mean_difference(z_original, z_shift, loss_type=loss_type)
+    return loss
 
 
 @gin.register
@@ -62,7 +75,8 @@ class PitchLoss(tfkl.Layer):
   def __init__(self, name='pitch_loss'):
     super().__init__(name=name)
 
-  def call(self, pitch_shift_steps, f0_hz_shift, f0_hz, coeff=20.):
+  def call(self, pitch_shift_steps, f0_hz_shift, f0_hz, coeff=1e2):
+    pitch_shift_steps = tf.cast(pitch_shift_steps, tf.float32)
     pitch_shift_steps = tf.reshape(pitch_shift_steps, (-1, 1, 1))  # (16, 1, 1)
     pitch_shift_steps = pitch_shift_steps * tf.ones_like(f0_hz_shift - f0_hz)  # (16, 1000, 1)
     return coeff * tf1.losses.huber_loss(pitch_shift_steps, f0_hz_shift - f0_hz,
@@ -75,6 +89,7 @@ class PitchLossCho(tfkl.Layer):
     super().__init__(name=name)
 
   def call(self, pitch_shift_steps, f0_hz_shift, f0_hz, coeff=20., reg_coeff=0.001):
+    pitch_shift_steps = tf.cast(pitch_shift_steps, tf.float32)
     pitch_shift_steps = tf.reshape(pitch_shift_steps, (-1, 1, 1))  # (16, 1, 1)
     pitch_shift_steps = pitch_shift_steps * tf.ones_like(f0_hz_shift - f0_hz)  # (16, 1000, 1)
     return coeff * (tf1.losses.huber_loss(pitch_shift_steps, f0_hz_shift - f0_hz,
@@ -87,9 +102,9 @@ class SalienceLoss(tfkl.Layer):
   def __init__(self, name='salience_loss'):
     super().__init__(name=name)
 
-  def call(self, pitch_shift_step, salience_shift, salience, coeff=100000000):
+  def call(self, pitch_shift_step, salience_shift, salience, coeff=1e9):
     """
-    pitch_shift_step: (batch, 1) [20 cent]
+    pitch_shift_step: (batch, 1) [20 cent], integer!
     salience_shift: (batch, 1000, 360)
     salience: (batch, 1000, 360), where 1 pitch-index diff means 20 cent
     """
@@ -106,14 +121,11 @@ class SalienceLoss(tfkl.Layer):
         huber_loss = tf1.losses.huber_loss(salience_shift[idx, :, pitch_shift_step[idx]:],
                                          salience[idx, :, :-pitch_shift_step[idx]],
                                          reduction=tf1.losses.Reduction.MEAN)
-        # logging.error('shift----positive')
       elif tf.less(pitch_shift_step[idx], tf.constant(0)):  # salience_shift is lower in pitch
         huber_loss = tf1.losses.huber_loss(salience_shift[idx, :, :pitch_shift_step[idx]],
                                            salience[idx, :, -pitch_shift_step[idx]:],
                                            reduction=tf1.losses.Reduction.MEAN)
-        # logging.error('shift--------------negative')
       else:
-        # logging.error('Hey zero shift step really? no way')
         huber_loss = 0.0
 
       losses += coeff * huber_loss

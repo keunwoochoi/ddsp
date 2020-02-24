@@ -169,9 +169,6 @@ def main(unused_argv):
 
 def console_entry_point():
   """From pip installed script."""
-  print('EAGER EXECUTION')
-  tf.executing_eagerly()
-  logging.info(tf.executing_eagerly())
   app.run(main)
 
 
