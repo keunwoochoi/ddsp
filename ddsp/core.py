@@ -25,7 +25,7 @@ from typing import Any, Dict, Text, TypeVar
 import gin
 import numpy as np
 from scipy import fftpack
-import tensorflow.compat.v1 as tf
+import tensorflow.compat.v2 as tf
 
 Number = TypeVar('Number', int, float, np.ndarray, tf.Tensor)
 
@@ -75,11 +75,11 @@ def midi_to_hz(notes: Number) -> Number:
 def hz_to_midi(frequencies: Number) -> Number:
   """TF-compatible hz_to_midi function."""
   frequencies = tf_float32(frequencies)
-  log2 = lambda x: tf.log(x) / tf.log(2.0)
+  log2 = lambda x: tf.math.log(x) / tf.math.log(2.0)
   notes = 12.0 * (log2(frequencies) - log2(440.0)) + 69.0
   # Map 0 Hz to MIDI 0 (Replace -inf with 0.)
   cond = tf.equal(notes, -np.inf)
-  notes = tf.where_v2(cond, 0.0, notes)
+  notes = tf.where(cond, 0.0, notes)
   return notes
 
 
@@ -87,11 +87,12 @@ def resample(inputs: tf.Tensor,
              n_timesteps: int,
              method: Text = 'linear',
              add_endpoint: bool = True) -> tf.Tensor:
-  """Interpolates a tensor of shape [:, n_frames, :] to [:, n_timesteps, :].
+  """Interpolates a tensor from n_frames to n_timesteps.
 
   Args:
-    inputs: Framewise 2-D or3-D Tensor. Shape [batch_size, n_frames] or shape
-      [batch_size, n_frames, channels].
+    inputs: Framewise 1-D, 2-D, 3-D, or 4-D Tensor. Shape [n_frames],
+      [batch_size, n_frames], [batch_size, n_frames, channels], or
+      [batch_size, n_frames, n_freq, channels].
     n_timesteps: Time resolution of the output signal.
     method: Type of resampling, must be in ['linear', 'cubic', 'window']. Linear
       and cubic ar typical bilinear, bicubic interpolation. Window uses
@@ -102,34 +103,52 @@ def resample(inputs: tf.Tensor,
       the last timestep as the endpoint, producing (n_frames - 1) segments with
       each having a length of n_timesteps / (n_frames - 1).
   Returns:
-    Interpolated 2-D or 3-D Tensor. Shape [batch_size, n_timesteps] or shape
-      [batch_size, n_timesteps, channels].
+    Interpolated 1-D, 2-D, 3-D, or 4-D Tensor. Shape [n_timesteps],
+      [batch_size, n_timesteps], [batch_size, n_timesteps, channels], or
+      [batch_size, n_timesteps, n_freqs, channels].
 
   Raises:
+    ValueError: If method is 'window' and input is 4-D.
     ValueError: If method is not one of 'linear', 'cubic', or 'window'.
   """
   inputs = tf_float32(inputs)
-  methods = {'linear': 0, 'cubic': 2}
-
+  is_1d = len(inputs.shape) == 1
   is_2d = len(inputs.shape) == 2
-  inputs = inputs[:, :, tf.newaxis] if is_2d else inputs
+  is_4d = len(inputs.shape) == 4
 
-  if method in methods:
-    outputs = inputs[:, :, tf.newaxis, :]
-    outputs = tf.image.resize(outputs,
-                              [n_timesteps, 1],
-                              method=methods[method],
-                              align_corners=not add_endpoint)
-    outputs = outputs[:, :, 0, :]
+  # Ensure inputs are at least 3d.
+  if is_1d:
+    inputs = inputs[tf.newaxis, :, tf.newaxis]
+  elif is_2d:
+    inputs = inputs[:, :, tf.newaxis]
 
+  def _image_resize(method):
+    """Closure around tf.image.resize."""
+    # Image resize needs 4-D input. Add/remove extra axis if not 4-D.
+    outputs = inputs[:, :, tf.newaxis, :] if not is_4d else inputs
+    outputs = tf.compat.v1.image.resize(outputs,
+                                        [n_timesteps, outputs.shape[2]],
+                                        method=method,
+                                        align_corners=not add_endpoint)
+    return outputs[:, :, 0, :] if not is_4d else outputs
+
+  # Perform resampling.
+  if method == 'linear':
+    outputs = _image_resize(tf.compat.v1.image.ResizeMethod.BILINEAR)
+  elif method == 'cubic':
+    outputs = _image_resize(tf.compat.v1.image.ResizeMethod.BICUBIC)
   elif method == 'window':
     outputs = upsample_with_windows(inputs, n_timesteps, add_endpoint)
-
   else:
     raise ValueError('Method ({}) is invalid. Must be one of {}.'.format(
-        method, list(methods.keys()) + ['window']))
+        method, "['linear', 'cubic', 'window']"))
 
-  outputs = outputs[:, :, 0] if is_2d else outputs
+  # Return outputs to the same dimensionality of the inputs.
+  if is_1d:
+    outputs = outputs[0, :, 0]
+  elif is_2d:
+    outputs = outputs[:, :, 0]
+
   return outputs
 
 
@@ -151,11 +170,17 @@ def upsample_with_windows(inputs: tf.Tensor,
     Upsampled 3-D tensor. Shape [batch_size, n_timesteps, n_channels].
 
   Raises:
+    ValueError: If input does not have 3 dimensions.
     ValueError: If attempting to use function for downsampling.
     ValueError: If n_timesteps is not divisible by n_frames (if add_endpoint is
       true) or n_frames - 1 (if add_endpoint is false).
   """
   inputs = tf_float32(inputs)
+
+  if len(inputs.shape) != 3:
+    raise ValueError('Upsample_with_windows() only supports 3 dimensions, '
+                     'not {}.'.format(inputs.shape))
+
   # Mimic behavior of tf.image.resize.
   # For forward (not endpointed), hold value for last interval.
   if add_endpoint:
@@ -203,7 +228,6 @@ def upsample_with_windows(inputs: tf.Tensor,
 # some global FLAGS to be set which is not avaiable in our codebase.
 def _tpu_cumsum(x, axis=0, exclusive=False):
   """A TPU efficient implementation of tf.cumsum()."""
-  tf.logging.info('--------fancy cumsum---------')
   x_shape = x.shape.as_list()
   rank = len(x_shape)
 
@@ -240,7 +264,7 @@ def log_scale(x, min_x, max_x):
   """Scales a -1 to 1 value logarithmically between min and max."""
   x = tf_float32(x)
   x = (x + 1.0) / 2.0  # Scale [-1, 1] to [0, 1]
-  return tf.exp((1.0 - x) * tf.log(min_x) + x * tf.log(max_x))
+  return tf.exp((1.0 - x) * tf.math.log(min_x) + x * tf.math.log(max_x))
 
 
 @gin.register
@@ -261,7 +285,7 @@ def exp_sigmoid(x, exponent=10.0, max_value=2.0, threshold=1e-7):
     A tensor with pointwise nonlinearity applied.
   """
   x = tf_float32(x)
-  return max_value * tf.nn.sigmoid(x)**tf.log(exponent) + threshold
+  return max_value * tf.nn.sigmoid(x)**tf.math.log(exponent) + threshold
 
 
 @gin.register
@@ -688,7 +712,7 @@ def fft_convolve(audio: tf.Tensor,
   audio_ir_fft = tf.multiply(audio_fft, ir_fft)
 
   # Take the IFFT to resynthesize audio.
-  audio_frames_out = tf.spectral.irfft(audio_ir_fft)
+  audio_frames_out = tf.signal.irfft(audio_ir_fft)
   audio_out = tf.signal.overlap_and_add(audio_frames_out, hop_size)
 
   # Crop and shift the output audio.
@@ -739,7 +763,7 @@ def apply_window_to_impulse_response(impulse_response: tf.Tensor,
 
   # Apply the window, to get new IR (both in zero-phase form).
   window = tf.broadcast_to(window, impulse_response.shape)
-  impulse_response = window * tf.real(impulse_response)
+  impulse_response = window * tf.math.real(impulse_response)
 
   # Put IR in causal form and trim zero padding.
   if padding > 0:
@@ -827,7 +851,7 @@ def sinc_impulse_response(cutoff_frequency, window_size=512, sample_rate=None):
   # Window the impulse response.
   window = tf.signal.hamming_window(full_size)
   window = tf.broadcast_to(window, impulse_response.shape)
-  impulse_response = window * tf.real(impulse_response)
+  impulse_response = window * tf.math.real(impulse_response)
 
   # Normalize for unity gain.
   impulse_response /= tf.reduce_sum(impulse_response, axis=-1, keepdims=True)

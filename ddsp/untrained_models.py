@@ -22,8 +22,9 @@ from __future__ import print_function
 
 from absl import logging
 import tensorflow.compat.v1 as tf
+import tensorflow.compat.v2 as tf2
 
-tfkl = tf.keras.layers
+tfkl = tf2.keras.layers
 
 
 class UntrainedModel(object):
@@ -40,17 +41,76 @@ class UntrainedModel(object):
   def variable_scope(self):
     return self._name
 
-  def __call__(self, audio):
+  def __call__(self, audio, training):
     with tf.variable_scope(self.variable_scope, reuse=tf.AUTO_REUSE):
-      outputs = self.get_outputs(audio)
+      outputs = self.get_outputs(audio, training)
       return outputs
 
-  def get_outputs(self, audio):
+  def get_outputs(self, audio, training):
     """Returns the output of the model, usually an embedding."""
     raise NotImplementedError
 
   def trainable_variables(self):
     return tf.trainable_variables(scope=self.variable_scope)
+
+
+def crepe_keras_model(model_capacity: str, mode: str, activation='relu'):
+  _capacity_multiplier = {
+        'tiny': 4,
+        'small': 8,
+        'medium': 16,
+        'large': 24,
+        'full': 32
+  }[model_capacity]
+
+  mode_cls = 'pitch_idx_classifier'
+  mode_reg = 'pitch_idx_regressor'
+  assert mode in [mode_cls, mode_reg]
+
+  model = tf.keras.Sequential()
+  k = tf.keras.layers  # short-cut for readability
+
+  layer_ids = [1, 2, 3, 4, 5, 6]
+  filters = [n * _capacity_multiplier for n in [32, 4, 4, 4, 8, 16]]
+  widths = [512, 64, 64, 64, 64, 64]
+  # note that unlike original crepe, there's no stride of (4, 1) at layer=1
+  # because we need 250 f0 prediction per second
+  strides = [(1, 1), (1, 1), (1, 1), (1, 1), (1, 1), (1, 1)]
+
+  model.add(k.Reshape((64000, 1, 1), input_shape=(64000,)))
+
+  for l, f, w, s in zip(layer_ids, filters, widths, strides):
+    model.add(
+          k.Conv2D(
+              f, (w, 1),
+              strides=s,
+              padding='same',
+              name='conv%d' % l))
+
+    model.add(k.BatchNormalization(name='conv%d-BN' % l))
+    model.add(k.Activation(activation, name='%s-%d' % (activation, l)))
+    model.add(
+          k.MaxPool2D(
+              pool_size=(2, 1),
+              strides=None,
+              padding='valid',
+              name='conv%d-maxpool' % l))
+    model.add(k.Dropout(0.25, name='conv%d-dropout' % l))
+  if mode == mode_cls:
+    model.add(k.Conv2D(360, (4, 1),
+                           padding='same',
+                           activation='sigmoid',
+                           name='dense_alternative'))  # (batch, 1000, 1, 360)
+    model.add(k.Reshape((1000, 360), name='classifier'))  # (batch, 1000, 360)
+  elif mode == mode_reg:
+    model.add(k.Conv2D(1, (4, 1),
+                       padding='same',
+                       activation='sigmoid',
+                       name='dense_alternative'))  # (batch, 1000, 1, 1)
+    model.add(k.Lambda(lambda x: 400.0 * x - 20.0))  # now [-20, 380]
+    model.add(k.Reshape((1000, 1), name='regressor'))  # (batch, 1000, 1)
+
+  return model
 
 
 class Crepe(tfkl.Layer):
@@ -151,10 +211,10 @@ class TrainableCREPE(UntrainedModel):
     self._model = Crepe(
         self._model_capacity, self._activation_layer, name=self._name)
 
-  def __call__(self, audio):
-    return self.get_outputs(audio)
+  def __call__(self, audio, training):
+    return self.get_outputs(audio, training)
 
-  def get_outputs(self, audio):
+  def get_outputs(self, audio, training):
     """Returns the embeddings.
 
     Args:
@@ -169,7 +229,7 @@ class TrainableCREPE(UntrainedModel):
 
     # TODO(gcj): relax this constraint by modifying the model to generate
     # outputs at every time point.
-    activation_dict = self._model(audio)
+    activation_dict = self._model(audio, training)
     if self._activation_layer not in activation_dict:
       raise ValueError(
           'activation layer {} not found, valid keys are {}'.format(
@@ -180,68 +240,67 @@ class TrainableCREPE(UntrainedModel):
     # post-processing to compute cent and hz should happen outside hereafter.
     return outputs
 
-
 """
-Layer (type)                 Output Shape              Param #   
+Model: "sequential"
+_________________________________________________________________
+Layer (type)                 Output Shape              Param #
 =================================================================
-input (InputLayer)           [(None, 64000)]           0         
+reshape (Reshape)            (None, 64000, 1, 1)       0
 _________________________________________________________________
-input-reshape (Reshape)      (None, 64000, 1, 1)       0         
+conv1 (Conv2D)               (None, 64000, 1, 128)     65664
 _________________________________________________________________
-conv1 (Conv2D)               (None, 64000, 1, 128)     65664     
+conv1-BN (BatchNormalization (None, 64000, 1, 128)     512
 _________________________________________________________________
-conv1-BN (BatchNormalization (None, 64000, 1, 128)     512       
+conv1-maxpool (MaxPooling2D) (None, 32000, 1, 128)     0
 _________________________________________________________________
-conv1-maxpool (MaxPooling2D) (None, 32000, 1, 128)     0         
+conv1-dropout (Dropout)      (None, 32000, 1, 128)     0
 _________________________________________________________________
-conv1-dropout (Dropout)      (None, 32000, 1, 128)     0         
+conv2 (Conv2D)               (None, 32000, 1, 16)      131088
 _________________________________________________________________
-conv2 (Conv2D)               (None, 32000, 1, 16)      131088    
+conv2-BN (BatchNormalization (None, 32000, 1, 16)      64
 _________________________________________________________________
-conv2-BN (BatchNormalization (None, 32000, 1, 16)      64        
+conv2-maxpool (MaxPooling2D) (None, 16000, 1, 16)      0
 _________________________________________________________________
-conv2-maxpool (MaxPooling2D) (None, 16000, 1, 16)      0         
+conv2-dropout (Dropout)      (None, 16000, 1, 16)      0
 _________________________________________________________________
-conv2-dropout (Dropout)      (None, 16000, 1, 16)      0         
+conv3 (Conv2D)               (None, 16000, 1, 16)      16400
 _________________________________________________________________
-conv3 (Conv2D)               (None, 16000, 1, 16)      16400     
+conv3-BN (BatchNormalization (None, 16000, 1, 16)      64
 _________________________________________________________________
-conv3-BN (BatchNormalization (None, 16000, 1, 16)      64        
+conv3-maxpool (MaxPooling2D) (None, 8000, 1, 16)       0
 _________________________________________________________________
-conv3-maxpool (MaxPooling2D) (None, 8000, 1, 16)       0         
+conv3-dropout (Dropout)      (None, 8000, 1, 16)       0
 _________________________________________________________________
-conv3-dropout (Dropout)      (None, 8000, 1, 16)       0         
+conv4 (Conv2D)               (None, 8000, 1, 16)       16400
 _________________________________________________________________
-conv4 (Conv2D)               (None, 8000, 1, 16)       16400     
+conv4-BN (BatchNormalization (None, 8000, 1, 16)       64
 _________________________________________________________________
-conv4-BN (BatchNormalization (None, 8000, 1, 16)       64        
+conv4-maxpool (MaxPooling2D) (None, 4000, 1, 16)       0
 _________________________________________________________________
-conv4-maxpool (MaxPooling2D) (None, 4000, 1, 16)       0         
+conv4-dropout (Dropout)      (None, 4000, 1, 16)       0
 _________________________________________________________________
-conv4-dropout (Dropout)      (None, 4000, 1, 16)       0         
+conv5 (Conv2D)               (None, 4000, 1, 32)       32800
 _________________________________________________________________
-conv5 (Conv2D)               (None, 4000, 1, 32)       32800     
+conv5-BN (BatchNormalization (None, 4000, 1, 32)       128
 _________________________________________________________________
-conv5-BN (BatchNormalization (None, 4000, 1, 32)       128       
+conv5-maxpool (MaxPooling2D) (None, 2000, 1, 32)       0
 _________________________________________________________________
-conv5-maxpool (MaxPooling2D) (None, 2000, 1, 32)       0         
+conv5-dropout (Dropout)      (None, 2000, 1, 32)       0
 _________________________________________________________________
-conv5-dropout (Dropout)      (None, 2000, 1, 32)       0         
+conv6 (Conv2D)               (None, 2000, 1, 64)       131136
 _________________________________________________________________
-conv6 (Conv2D)               (None, 2000, 1, 64)       131136    
+conv6-BN (BatchNormalization (None, 2000, 1, 64)       256
 _________________________________________________________________
-conv6-BN (BatchNormalization (None, 2000, 1, 64)       256       
+conv6-maxpool (MaxPooling2D) (None, 1000, 1, 64)       0
 _________________________________________________________________
-conv6-maxpool (MaxPooling2D) (None, 1000, 1, 64)       0         
+conv6-dropout (Dropout)      (None, 1000, 1, 64)       0
 _________________________________________________________________
-conv6-dropout (Dropout)      (None, 1000, 1, 64)       0         
+dense_alternative (Conv2D)   (None, 1000, 1, 360)      92520
 _________________________________________________________________
-classifier (Conv2D)          (None, 1000, 1, 360)      23400     
-_________________________________________________________________
-reshape (Reshape)            (None, 1000, 360)         0         
+classifier (Reshape)         (None, 1000, 360)         0
 =================================================================
-Total params: 417,976
-Trainable params: 417,432
+Total params: 487,096
+Trainable params: 486,552
 Non-trainable params: 544
 _________________________________________________________________
 """

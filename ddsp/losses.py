@@ -15,61 +15,126 @@
 # Lint as: python3
 """Library of loss functions."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import functools
+from absl import logging
 
-from ddsp import pretrained_models
+import crepe
 from ddsp import spectral_ops
 from ddsp.core import tf_float32
 
 import gin
-import tensorflow.compat.v1 as tf
+import tensorflow.compat.v2 as tf
+import tensorflow.compat.v1 as tf1
+
+tfkl = tf.keras.layers
 
 
 # ---------------------- Losses ------------------------------------------------
 def mean_difference(target, value, loss_type='L1'):
+  """Common loss functions.
+
+  Args:
+    target: Target tensor.
+    value: Value tensor.
+    loss_type: One of 'L1', 'L2', or 'COSINE'.
+
+  Returns:
+    The average loss.
+
+  Raises:
+    ValueError: If loss_type is not an allowed value.
+  """
   difference = target - value
+  loss_type = loss_type.upper()
   if loss_type == 'L1':
     return tf.reduce_mean(tf.abs(difference))
   elif loss_type == 'L2':
     return tf.reduce_mean(difference**2)
-  elif loss_type == 'cosine':
+  elif loss_type == 'COSINE':
     return tf.losses.cosine_distance(target, value, axis=-1)
-
-
-class Loss(object):
-  """Base class to implement any loss.
-
-  Users should override compute_loss() to define the actual loss.
-  Hyper-parameters of the loss will be passed through the constructor.
-  """
-
-  def __init__(self, name):
-    self.name = name
-    self.pretrained_model = None
-
-  def __call__(self, *args, **kwargs):
-    """Alias to compute_loss."""
-    return self.compute_loss(*args, **kwargs)
-
-  def compute_loss(self, audio, target_audio):
-    """Subclasses must implement compute_loss().
-
-    Args:
-      audio: 2D tensor of shape [batch, time].
-      target_audio: 2D tensor of shape [batch, time].
-
-    Returns:
-      A scalar tensor of the loss.
-    """
-    raise NotImplementedError
+  elif loss_type == 'huber':
+    return tf1.losses.huber_loss(target, value,
+                                 reduction=tf1.losses.Reduction.MEAN)
+  else:
+    raise ValueError('Loss type ({}), must be '
+                     '"L1", "L2", or "COSINE"'.format(loss_type))
 
 
 @gin.register
-class SpectralLoss(Loss):
+class DisentangleLossSimple(tfkl.Layer):
+  def __init__(self, name='disentangle_loss_simple'):
+    super().__init__(name=name)
+
+  def call(self, z_original, z_shift, loss_type='huber', coeff=1e1):
+    loss = coeff * mean_difference(z_original, z_shift, loss_type=loss_type)
+    return loss
+
+
+@gin.register
+class PitchLoss(tfkl.Layer):
+  def __init__(self, name='pitch_loss'):
+    super().__init__(name=name)
+
+  def call(self, pitch_shift_steps, f0_hz_shift, f0_hz, coeff=1e2):
+    pitch_shift_steps = tf.cast(pitch_shift_steps, tf.float32)
+    pitch_shift_steps = tf.reshape(pitch_shift_steps, (-1, 1, 1))  # (16, 1, 1)
+    pitch_shift_steps = pitch_shift_steps * tf.ones_like(f0_hz_shift - f0_hz)  # (16, 1000, 1)
+    return coeff * tf1.losses.huber_loss(pitch_shift_steps, f0_hz_shift - f0_hz,
+                                         reduction=tf1.losses.Reduction.MEAN)
+
+
+@gin.register
+class PitchLossCho(tfkl.Layer):
+  def __init__(self, name='pitch_loss_cho'):
+    super().__init__(name=name)
+
+  def call(self, pitch_shift_steps, f0_hz_shift, f0_hz, coeff=20., reg_coeff=0.001):
+    pitch_shift_steps = tf.cast(pitch_shift_steps, tf.float32)
+    pitch_shift_steps = tf.reshape(pitch_shift_steps, (-1, 1, 1))  # (16, 1, 1)
+    pitch_shift_steps = pitch_shift_steps * tf.ones_like(f0_hz_shift - f0_hz)  # (16, 1000, 1)
+    return coeff * (tf1.losses.huber_loss(pitch_shift_steps, f0_hz_shift - f0_hz,
+                                         reduction=tf1.losses.Reduction.MEAN)
+                    + reg_coeff * tf.reduce_mean(tf.math.pow(f0_hz, 2)))
+
+
+@gin.register
+class SalienceLoss(tfkl.Layer):
+  def __init__(self, name='salience_loss'):
+    super().__init__(name=name)
+
+  def call(self, pitch_shift_step, salience_shift, salience, coeff=1e9):
+    """
+    pitch_shift_step: (batch, 1) [20 cent], integer!
+    salience_shift: (batch, 1000, 360)
+    salience: (batch, 1000, 360), where 1 pitch-index diff means 20 cent
+    """
+    # pitch_shift_20cents = tf.cast(pitch_shift_20cents, tf.int32)
+
+    batch_size = pitch_shift_step.shape[0]
+    losses = 0.0
+    # normalize salience
+    salience = tf.nn.softmax(salience, axis=-1)
+    salience_shift = tf.nn.softmax(salience_shift, axis=-1)
+
+    for idx in range(batch_size):
+      if tf.greater(pitch_shift_step[idx], tf.constant(0)):  # salience_shift is higher in pitch
+        huber_loss = tf1.losses.huber_loss(salience_shift[idx, :, pitch_shift_step[idx]:],
+                                         salience[idx, :, :-pitch_shift_step[idx]],
+                                         reduction=tf1.losses.Reduction.MEAN)
+      elif tf.less(pitch_shift_step[idx], tf.constant(0)):  # salience_shift is lower in pitch
+        huber_loss = tf1.losses.huber_loss(salience_shift[idx, :, :pitch_shift_step[idx]],
+                                           salience[idx, :, -pitch_shift_step[idx]:],
+                                           reduction=tf1.losses.Reduction.MEAN)
+      else:
+        huber_loss = 0.0
+
+      losses += coeff * huber_loss
+
+    return tf1.reduce_mean(losses)
+
+
+@gin.register
+class SpectralLoss(tfkl.Layer):
   """Multi-scale spectrogram loss."""
 
   def __init__(self,
@@ -83,7 +148,7 @@ class SpectralLoss(Loss):
                logmag_weight=0.0,
                loudness_weight=0.0,
                name='spectral_loss'):
-    super(SpectralLoss, self).__init__(name=name)
+    super().__init__(name=name)
     self.fft_sizes = fft_sizes
     self.loss_type = loss_type
     self.mag_weight = mag_weight
@@ -94,7 +159,7 @@ class SpectralLoss(Loss):
     self.logmag_weight = logmag_weight
     self.loudness_weight = loudness_weight
 
-  def compute_loss(self, audio, target_audio):
+  def call(self, audio, target_audio):
 
     loss = 0.0
     loss_ops = []
@@ -155,7 +220,7 @@ class SpectralLoss(Loss):
 
 
 @gin.register
-class EmbeddingLoss(Loss):
+class EmbeddingLoss(tfkl.Layer):
   """Embedding loss for a given pretrained model.
 
   Calculates the embedding loss given a pretrained model.
@@ -169,12 +234,12 @@ class EmbeddingLoss(Loss):
                loss_type='L1',
                pretrained_model=None,
                name='embedding_loss'):
-    super(EmbeddingLoss, self).__init__(name=name)
+    super().__init__(name=name)
     self.weight = weight
     self.loss_type = loss_type
     self.pretrained_model = pretrained_model
 
-  def compute_loss(self, audio, target_audio):
+  def call(self, audio, target_audio):
     audio, target_audio = tf_float32(audio), tf_float32(target_audio)
     target_emb = self.pretrained_model(target_audio)
     synth_emb = self.pretrained_model(audio)
@@ -191,31 +256,94 @@ class PretrainedCREPEEmbeddingLoss(EmbeddingLoss):
                loss_type='L1',
                model_capacity='tiny',
                activation_layer='classifier',
-               checkpoint='gs://ddsp/crepe/model-tiny.ckpt',
                name='pretrained_crepe_embedding_loss'):
     # Scale each layer activation loss to comparable scales.
     scale = {
-        'classifier': 6.8e-4,
-        'conv6-maxpool': 2.5e4,
-        'conv5-maxpool': 4.0e4,
-        'conv4-maxpool': 4.9e3,
-        'conv3-maxpool': 4.0e2,
-        'conv2-maxpool': 3.0e1,
-        'conv1-maxpool': 1.3e0,
-        'conv6-BN': 1.8e4,
-        'conv5-BN': 3.5e4,
-        'conv4-BN': 3.9e3,
-        'conv3-BN': 2.6e2,
-        'conv2-BN': 2.1e1,
-        'conv1-BN': 1.0e0,
+        'conv1-BN': 1.3,
+        'conv1-maxpool': 1.0,
+        'conv2-BN': 1.4,
+        'conv2-maxpool': 1.1,
+        'conv3-BN': 1.9,
+        'conv3-maxpool': 1.6,
+        'conv4-BN': 1.5,
+        'conv4-maxpool': 1.4,
+        'conv5-BN': 1.9,
+        'conv5-maxpool': 1.7,
+        'conv6-BN': 30,
+        'conv6-maxpool': 25,
+        'classifier': 130,
     }[activation_layer]
-    super(PretrainedCREPEEmbeddingLoss, self).__init__(
-        weight=20 / scale * weight,
+    super().__init__(
+        weight=20.0 * scale * weight,
         loss_type=loss_type,
         name=name,
-        pretrained_model=pretrained_models.PretrainedCREPE(
-            model_capacity=model_capacity,
-            activation_layer=activation_layer,
-            checkpoint=checkpoint))
+        pretrained_model=PretrainedCREPE(model_capacity=model_capacity,
+                                         activation_layer=activation_layer))
+
+
+class PretrainedCREPE(tfkl.Layer):
+  """Pretrained CREPE model with frozen weights."""
+
+  def __init__(self,
+               model_capacity='tiny',
+               activation_layer='conv5-maxpool',
+               name='pretrained_crepe',
+               trainable=False):
+    super(PretrainedCREPE, self).__init__(name=name, trainable=trainable)
+    self._model_capacity = model_capacity
+    self._activation_layer = activation_layer
+    spectral_ops.reset_crepe()
+    self._model = crepe.core.build_and_load_model(self._model_capacity)
+    self.frame_length = 1024
+
+  def build(self, x_shape):
+    self.layer_names = [l.name for l in self._model.layers]
+
+    if self._activation_layer not in self.layer_names:
+      raise ValueError(
+          'activation layer {} not found, valid names are {}'.format(
+              self._activation_layer, self.layer_names))
+
+    self._activation_model = tf.keras.Model(
+        inputs=self._model.input,
+        outputs=self._model.get_layer(self._activation_layer).output)
+
+    # Variables are not to be trained.
+    self._model.trainable = self.trainable
+    self._activation_model.trainable = self.trainable
+
+  def frame_audio(self, audio, hop_length=1024, center=True):
+    """Slice audio into frames for crepe."""
+    # Pad so that frames are centered around their timestamps.
+    # (i.e. first frame is zero centered).
+    pad = int(self.frame_length / 2)
+    audio = tf.pad(audio, ((0, 0), (pad, pad))) if center else audio
+    frames = tf.signal.frame(audio,
+                             frame_length=self.frame_length,
+                             frame_step=hop_length)
+
+    # Normalize each frame -- this is expected by the model.
+    mean, var = tf.nn.moments(frames, [-1], keepdims=True)
+    frames -= mean
+    frames /= (var**0.5 + 1e-5)
+    return frames
+
+  def call(self, audio):
+    """Returns the embeddings.
+
+    Args:
+      audio: tensors of shape [batch, length]. Length must be divisible by 1024.
+
+    Returns:
+      activations of shape [batch, depth]
+    """
+    frames = self.frame_audio(audio)
+    batch_size = int(frames.shape[0])
+    n_frames = int(frames.shape[1])
+    # Get model predictions.
+    frames = tf.reshape(frames, [-1, self.frame_length])
+    outputs = self._activation_model(frames)
+    outputs = tf.reshape(outputs, [batch_size, n_frames, -1])
+    return outputs
 
 

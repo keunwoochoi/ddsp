@@ -21,6 +21,9 @@ MfccTimeDistributedRnnEncoder.rnn_type = 'gru'
 MfccTimeDistributedRnnEncoder.z_dims = 16
 MfccTimeDistributedRnnEncoder.z_time_steps = 125
 
+# Crepe fun
+AutoencoderDdspice.crepe_mode = 'pitch_idx_classifier'
+
 # Decoder
 AutoencoderDdspice.decoder = @decoders.ZRnnFcDecoder()
 ZRnnFcDecoder.rnn_channels = 512
@@ -35,6 +38,7 @@ ZRnnFcDecoder.output_splits = (('amps', 1),
 # Losses
 AutoencoderDdspice.losses = [
     @losses.SpectralLoss(),
+    @losses.PitchLoss()
 ]
 SpectralLoss.loss_type = 'L1'
 SpectralLoss.mag_weight = 1.0
