@@ -52,7 +52,7 @@ def mean_difference(target, value, loss_type='L1'):
     return tf.reduce_mean(difference**2)
   elif loss_type == 'COSINE':
     return tf.losses.cosine_distance(target, value, axis=-1)
-  elif loss_type == 'huber':
+  elif loss_type == 'HUBER':
     return tf1.losses.huber_loss(target, value,
                                  reduction=tf1.losses.Reduction.MEAN)
   else:
@@ -65,7 +65,7 @@ class DisentangleLossSimple(tfkl.Layer):
   def __init__(self, name='disentangle_loss_simple'):
     super().__init__(name=name)
 
-  def call(self, z_original, z_shift, loss_type='huber', coeff=1e1):
+  def call(self, z_original, z_shift, loss_type='HUBER', coeff=1e1):
     loss = coeff * mean_difference(z_original, z_shift, loss_type=loss_type)
     return loss
 
@@ -75,7 +75,7 @@ class PitchLoss(tfkl.Layer):
   def __init__(self, name='pitch_loss'):
     super().__init__(name=name)
 
-  def call(self, pitch_shift_steps, f0_hz_shift, f0_hz, coeff=1e2):
+  def call(self, pitch_shift_steps, f0_hz_shift, f0_hz, coeff=1e1):
     pitch_shift_steps = tf.cast(pitch_shift_steps, tf.float32)
     pitch_shift_steps = tf.reshape(pitch_shift_steps, (-1, 1, 1))  # (16, 1, 1)
     pitch_shift_steps = pitch_shift_steps * tf.ones_like(f0_hz_shift - f0_hz)  # (16, 1000, 1)
